@@ -34,12 +34,16 @@ def report(rep, h, u, v):
     extra = []
     for key, lab in [("smsp__warps_active.avg.per_cycle_active", "warps/sch"),
                      ("smsp__warps_eligible.avg.per_cycle_active", "elig/sch"),
+                     ("smsp__issue_active.avg.pct_of_peak_sustained_active", "issue%"),
+                     ("smsp__inst_executed.sum", "inst"),
+                     ("sm__inst_executed.avg.per_cycle_active", "ipc"),
+                     ("sm__warps_active.avg.pct_of_peak_sustained_active", "occ%"),
                      ("launch__registers_per_thread", "regs"), ("launch__grid_size", "grid"),
                      ("launch__block_size", "blk")]:
         if key in d and d[key][0] is not None:
             extra.append(f"{lab}={d[key][0]:g}")
     name = rep.split("/")[-1].replace(".ncu-rep", "")
-    print(f"{name:24s} {kname:34s} {t:8.2f} us  {mb:8.2f} MB  {mb / t * 1e-3 if t else 0:5.2f} TB/s  " + " ".join(extra))
+    print(f"{name:24s} {kname:34s} {t:8.2f} us  {mb:8.2f} MB  {mb / t if t else 0:5.2f} TB/s  " + " ".join(extra))
     print(f"{'':59s} stalls/issue: " + "  ".join(f"{n}={x:.1f}" for x, n in stalls[:5]))
 
 

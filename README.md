@@ -12,7 +12,7 @@ Speedup over SGLang's kernel, on **one NVIDIA H100 SXM 80GB**. Higher is better;
 |---|---|---:|---|
 | [`muse_bf16_proj`](muse_bf16_proj/) | Dense BF16 projections and the FP32 router (GEMV / skinny GEMM) | **1.17×** | done |
 | [`muse_attention_decode`](muse_attention_decode/) | Decode and speculative-verify attention over an 80K-token paged FP8 KV cache | **1.44×** | done |
-| [`muse_moe_w4a16`](muse_moe_w4a16/) | Routed experts: top-8 of 256, NVFP4 weights, SwiGLU, per-expert norm | — | in progress |
+| [`muse_moe_w4a16`](muse_moe_w4a16/) | Routed experts: top-8 of 256, NVFP4 weights, SwiGLU, per-expert norm | **1.60×** | iterating |
 | `muse_decode_layer` | A full decode layer | — | not started |
 | `muse_prefill_layer` | A full prefill layer | — | not started |
 
@@ -70,6 +70,44 @@ The biggest wins, each found with an Nsight Compute profile:
 
 **Known gap:** verify on full-attention layers (8 query tokens per request at 80K context) still runs at 0.79–0.93× of FA3. With 8 query tokens it's close to compute-bound, and needs FA3-class `wgmma` and `exp2` throughput.
 
+### `muse_moe_w4a16`: 1.60×
+
+Speedup over SGLang's Marlin MoE path, per load (one shape per load, times in µs):
+
+| Load | Tokens | SGLang (Marlin) µs | Ours µs | Speedup |
+|---|---:|---:|---:|---:|
+| decode 1 | 1 | 85.6 | 38.4 | 2.23× |
+| decode 16 | 16 | 180.4 | 108.7 | 1.66× |
+| decode 32 | 32 | 180.0 | 143.2 | 1.26× |
+| verify 1 | 8 | 160.6 | 102.0 | 1.57× |
+| verify 16 | 128 | 485.6 | 320.0 | 1.52× |
+| verify 32 | 256 | 642.9 | 430.8 | 1.49× |
+| **Geomean** | | | | **1.60×** |
+
+**What made it faster.** The design is four raw-CUDA kernels, compiled in-process with NVRTC:
+1. **Route:** groups each token's local (token, expert) pairs by expert and writes the work items.
+2. **Gate/up GEMM:** computes SiLU(gate)·up in the epilogue.
+3. **Down GEMM:** applies the norm weight and accumulates each row's sum of squares in the epilogue.
+4. **Norm + weighted sum.**
+
+How the two GEMMs work:
+- **Weights are dequantized in registers.** NVFP4 weights go to BF16 on the fly and feed `mma.sync` tensor-core instructions, with the weights as the tall operand and tokens as the narrow one.
+- **The weights are repacked once, in `prepare()`.** Each thread's 8 FP4 values for one k-step sit in one 32-bit word. The bits are placed so that a shift and a mask turn them into BF16 values, and one `bf16x2` multiply applies the FP8 block scale. That's about 11 integer ops per 8 weights.
+- **A single warp keeps the pipeline full.** It streams each CTA's weight chunk, scales and token rows into a shared-memory ring with `cp.async.bulk` (1-D TMA) and mbarriers.
+- **Tuning favours occupancy.** A small ring (2–4 stages) leaves room for more CTAs on each SM, and that matters most because the dequant makes these GEMMs instruction-heavy.
+
+**What didn't help:**
+- **Split-K at small batches:** the extra warps just waited on data.
+- **8-warp CTAs:** they halve the activation traffic, but 4 warps still won at every batch size.
+- **Scheduling the work items of a hot expert together** to share L2: no better.
+- **Bigger token blocks:** fewer CTAs fit on each SM, and that cost more than the re-dequantization they save.
+
+**Known gap.** At 3.35 TB/s, a kernel that only streams weights would score about 2.4× here. The remaining time is mostly in two places:
+- **Verify 16/32 are instruction-bound.** Hot experts take up to 161 tokens and get re-dequantized once per 16-token item.
+- **Decode 1 is limited by data movement.** About 20 µs is the floor; we take 38 µs.
+
+The next step is to dequantize into shared memory once per expert and use `wgmma`, and to prefetch the down-projection weights into L2.
+
 ## Methodology
 
 `bench.py` in each problem folder stands in for the official judge, which had closed:
@@ -80,7 +118,7 @@ The biggest wins, each found with an Nsight Compute profile:
 - **Fixed cost removed:** a graph replay's fixed cost (about 4–5 µs) is subtracted from both sides, as the judge does.
 - **Scoring:** a load's time is the weighted sum of its shapes. The problem score is the **geometric mean over loads**, so every load counts equally.
 - **Correctness:** every scored shape and every judge test is checked against the problem's reference: relative L2 error over the whole output, plus a per-row bound.
-- **Baseline:** SGLang at the pinned commit `a55ab7d5`, running its real kernels: FA3 from `sglang-kernel` 0.4.9, Marlin MoE, and cuBLAS.
+- **Baseline:** SGLang at the pinned commit `a55ab7d5`, running its real kernels: FA3 from `sglang-kernel` 0.4.9, Marlin MoE, and cuBLAS. For the MoE baseline, `sgl_stubs.py` stubs the serving-only SGLang modules that its import chain pulls in (vision configs, flashinfer); the Marlin kernels themselves are the real ones.
 
 **Environment:** H100 SXM 80GB (3.35 TB/s HBM3) on the Alliance (Compute Canada) *Rorqual* cluster, PyTorch 2.14.1 + CUDA 13.2, Triton 3.6.
 

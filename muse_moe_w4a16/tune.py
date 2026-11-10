@@ -23,7 +23,7 @@ def time_cfg(sub, st, sets, flush, overhead, reps):
     ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(reps)]
     for i in range(4):  # warm
         flush(); gs[i % len(gs)].replay()
-    for r, (a, b) in enumerate(ev):  # queue in chunks of 40 (longer queues inflate event times)
+    for r, (a, b) in enumerate(ev):  # queue in chunks of 40, sync between chunks
         flush()
         a.record()
         gs[r % len(gs)].replay()
@@ -41,10 +41,18 @@ def main():
     ap.add_argument("--m", type=int, nargs="*", default=None)
     ap.add_argument("--reps", type=int, default=40)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--tb", type=int, nargs="*", default=[8, 16, 32])
+    ap.add_argument("--nst", type=int, nargs="*", default=[2, 3, 4])
+    ap.add_argument("--slots", type=int, nargs="*", default=[2, 4, 8, 16, 32, 64])
+    ap.add_argument("--item-fast", type=int, default=None)
+    ap.add_argument("--ks", type=int, nargs="*", default=[1])
+    ap.add_argument("--w", type=int, nargs="*", default=[4])
     ap.add_argument("--out", default=os.path.join(HERE, "tuned.json"))
     args = ap.parse_args()
     weights = R.generate_weights(R.WEIGHTS_SEED)
     sub = load_module(args.sub, "submission")
+    if args.item_fast is not None:
+        sub.ITEM_FAST = args.item_fast
     st = sub.prepare(weights)
     flush = Flusher()
     overhead = graph_overhead(flush)
@@ -54,12 +62,12 @@ def main():
             continue
         sets = [gen(M, seed=100 + i) for i in range(2)]
         res = []
-        for tb, nst, slots in itertools.product([8, 16, 32, 64], [3, 4, 5, 6, 8], [2, 4, 8, 16, 32]):
-            if sub._smem(tb, nst) > 220 * 1024:
+        for tb, nst, slots, k1, k2, w in itertools.product(args.tb, args.nst, args.slots, args.ks, args.ks, args.w):
+            if sub._smem(tb, nst, w) > 220 * 1024 or (max(k1, k2) > 1 and M * 8 > sub.WS_PAIRS):
                 continue
-            sub.CFG_OVERRIDE[M] = (tb, nst, slots)
+            sub.CFG_OVERRIDE[M] = (tb, nst, slots, k1, k2, w)
             try:
-                res.append((time_cfg(sub, st, sets, flush, overhead, args.reps), (tb, nst, slots)))
+                res.append((time_cfg(sub, st, sets, flush, overhead, args.reps), (tb, nst, slots, k1, k2, w)))
                 if args.verbose:
                     print(f"    {res[-1][1]} {res[-1][0]:.2f}", flush=True)
             except Exception as e:

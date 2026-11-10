@@ -19,6 +19,7 @@ A knowledge base for writing fast GPU kernels on Hopper (H100/H200), aimed at th
 - [[roofline-and-arithmetic-intensity]]: intensity ≈ m FLOP/B; where m = 128/256 stops being free
 - [[memory-bandwidth-and-latency]]: Little's law; more than 32 KiB in flight per SM on Hopper
 - [[split-k-and-stream-k]]: filling 132 SMs at small n; self-resetting last-CTA reduction
+- [[nvfp4-moe-weight-streaming]]: NVFP4 MoE experts with FP4→BF16 dequant in registers, mma.sync and a bulk-copy ring; 1.60× over SGLang Marlin on H100
 - [[split-kv-decode-attention]]: paged FP8 decode/verify attention in Triton (block-diagonal GQA, vectorized merge, FP8 QK); 1.44× over SGLang FA3 on H100
 - [[register-direct-weight-streaming]]: W straight into mma.sync fragments via a k-permutation; measured slower than tuned Triton on H100 (negative result)
 - [[speculative-decoding-shapes]]: verify blocks give m = 8 × batch

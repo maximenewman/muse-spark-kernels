@@ -57,7 +57,7 @@ H = 4096
 I = 4096
 TOPK = 8
 NLOC = 32
-W = 4            # consumer warps per GEMM CTA
+WP = 4           # warps per packed weight tile (prepare); a CTA runs W in {2, 4, 8} consumer warps
 KSS = 16         # k-steps (16 K each) per pipeline stage
 NSTG = H // (16 * KSS)  # stages per K sweep (K = 4096 for both GEMMs)
 EPS = 1e-8
@@ -180,21 +180,35 @@ GEMM_SRC = COMMON + r"""
 #define NB (TB / 8)
 #if MODE == 1
 #define CT (4096 / (8 * W))
+#define CTP (4096 / (8 * WP))
 #else
 #define CT (4096 / (16 * W))
+#define CTP (4096 / (16 * WP))
 #endif
+#define CW (W < WP ? W : WP)      // warps per bulk copy (contiguous within a packed tile)
+#define NCH (W / CW)              // copies per stage for A and for SF
 
 extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
     const u32* __restrict__ wq, const unsigned char* __restrict__ wsf, const float* __restrict__ gsc,
     const u16* __restrict__ xsrc, const int* __restrict__ sorted_tok, const int* __restrict__ items,
-    const int* __restrict__ n_items, u16* __restrict__ out, const u16* __restrict__ normw, float* __restrict__ ss) {
+    const int* __restrict__ n_items, u16* __restrict__ out, const u16* __restrict__ normw, float* __restrict__ ss,
+    float* __restrict__ ws, int* __restrict__ cnt) {
+  // split-K: blockIdx.z of gridDim.z takes stages [k0, k1); partial sums go to ws (fp32, zero between
+  // uses) and the last CTA of each (item, row tile) runs the epilogue and re-zeroes ws / cnt.
   extern __shared__ __align__(128) unsigned char smem[];
+  __shared__ int s_last;
+  const int KS = gridDim.z;
+  const int k0 = blockIdx.z * NSTG / KS, k1 = (blockIdx.z + 1) * NSTG / KS;
   const int nI = *n_items;
-  if ((int)blockIdx.y >= nI) return;
+#if ITEM_FAST
+  const int slot0 = blockIdx.x, nslot = gridDim.x, ct = blockIdx.y;
+#else
+  const int slot0 = blockIdx.y, nslot = gridDim.y, ct = blockIdx.x;
+#endif
+  if (slot0 >= nI) return;
   unsigned long long* bars = (unsigned long long*)smem;   // full[NST], empty[NST]
   unsigned char* stages = smem + 128;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int ct = blockIdx.x;
   if (threadIdx.x == 0) {
     for (int s = 0; s < NST; ++s) { mbar_init(smem_u32(&bars[s]), 1); mbar_init(smem_u32(&bars[NST + s]), W); }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -204,10 +218,16 @@ extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
   if (warp == W) {  // producer
     if (lane == 0) {
       int it = 0;
-      for (int item = blockIdx.y; item < nI; item += gridDim.y) {
+      for (int item = slot0; item < nI; item += nslot) {
         const int e = items[3 * item], ps = items[3 * item + 1], n = items[3 * item + 2];
-        const u32* wbase = wq + ((size_t)(e * CT + ct) * NSTG) * (A_BYTES / 4);
-        const unsigned char* sbase = wsf + ((size_t)(e * CT + ct) * NSTG) * SF_BYTES;
+        const u32* wsrc[NCH];
+        const unsigned char* ssrc[NCH];
+        #pragma unroll
+        for (int c = 0; c < NCH; ++c) {
+          const int gw = ct * W + c * CW, pt = gw / WP, wl = gw % WP;
+          wsrc[c] = wq + ((size_t)(e * CTP + pt) * NSTG) * (WP * KSS * 32) + wl * KSS * 32;
+          ssrc[c] = wsf + ((size_t)(e * CTP + pt) * NSTG) * (WP * 16 * KSS) + wl * 16 * KSS;
+        }
         int rows[TB];
         #pragma unroll
         for (int r = 0; r < TB; ++r) {
@@ -217,14 +237,17 @@ extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
           rows[r] = ps + r;
 #endif
         }
-        for (int k = 0; k < NSTG; ++k, ++it) {
+        for (int k = k0; k < k1; ++k, ++it) {
           const int st = it % NST, rnd = it / NST;
           if (rnd > 0) mbar_wait(smem_u32(&bars[NST + st]), (rnd - 1) & 1);
           const u32 fb = smem_u32(&bars[st]);
           unsigned char* sp = stages + st * STAGE_BYTES;
           mbar_expect_tx(fb, A_BYTES + SF_BYTES + n * XROW);
-          bulk_g2s(smem_u32(sp), wbase + (size_t)k * (A_BYTES / 4), A_BYTES, fb);
-          bulk_g2s(smem_u32(sp + A_BYTES), sbase + (size_t)k * SF_BYTES, SF_BYTES, fb);
+          #pragma unroll
+          for (int c = 0; c < NCH; ++c) {
+            bulk_g2s(smem_u32(sp + c * CW * KSS * 128), wsrc[c] + (size_t)k * (WP * KSS * 32), CW * KSS * 128, fb);
+            bulk_g2s(smem_u32(sp + A_BYTES + c * CW * 16 * KSS), ssrc[c] + (size_t)k * (WP * 16 * KSS), CW * 16 * KSS, fb);
+          }
           #pragma unroll
           for (int r = 0; r < TB; ++r)
             if (r < n) bulk_g2s(smem_u32(sp + A_BYTES + SF_BYTES + r * XSTRIDE), xsrc + (size_t)rows[r] * 4096 + k * KSS * 16, XROW, fb);
@@ -237,15 +260,18 @@ extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
   // consumers
   const int g = lane >> 2, t = lane & 3;
   int it = 0;
-  for (int item = blockIdx.y; item < nI; item += gridDim.y) {
+  for (int item = slot0; item < nI; item += nslot) {
     const int e = items[3 * item], ps = items[3 * item + 1], n = items[3 * item + 2];
     float acc[NB][4];
     #pragma unroll
     for (int b = 0; b < NB; ++b) { acc[b][0] = acc[b][1] = acc[b][2] = acc[b][3] = 0.f; }
-    for (int k = 0; k < NSTG; ++k, ++it) {
+    for (int k = k0; k < k1; ++k, ++it) {
       const int st = it % NST, rnd = it / NST;
       mbar_wait(smem_u32(&bars[st]), rnd & 1);
       const unsigned char* sp = stages + st * STAGE_BYTES;
+#ifdef NOCOMPUTE
+      if (true) { __syncwarp(); if (lane == 0) mbar_arrive(smem_u32(&bars[NST + st])); continue; }
+#endif
       const uint4* As = (const uint4*)sp + warp * (KSS / 4) * 32 + lane;
       const unsigned char* Ss = sp + A_BYTES + warp * 16 * KSS;
       const u32 xs = smem_u32(sp + A_BYTES + SF_BYTES);
@@ -259,7 +285,7 @@ extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
         u32 bq[NB][8];
         #pragma unroll
         for (int b = 0; b < NB; ++b) {
-          if (b * 8 >= n) break;
+          if (b > 0 && b * 8 >= n) break;  // b = 0 always has tokens
           ldsm4(bq[b][0], bq[b][1], bq[b][2], bq[b][3], xl + b * 8 * XSTRIDE + (kq * 4) * 32);
           ldsm4(bq[b][4], bq[b][5], bq[b][6], bq[b][7], xl + b * 8 * XSTRIDE + (kq * 4 + 2) * 32);
         }
@@ -274,11 +300,52 @@ extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
           unp4(q, a0, a1, a2, a3);
           a0 = bmul2(a0, S0); a1 = bmul2(a1, S1); a2 = bmul2(a2, S0); a3 = bmul2(a3, S1);
           #pragma unroll
-          for (int b = 0; b < NB; ++b) { if (b * 8 >= n) break; mma16816(acc[b], a0, a1, a2, a3, bq[b][2 * kk], bq[b][2 * kk + 1]); }
+          for (int b = 0; b < NB; ++b) { if (b > 0 && b * 8 >= n) break; mma16816(acc[b], a0, a1, a2, a3, bq[b][2 * kk], bq[b][2 * kk + 1]); }
         }
       }
       __syncwarp();
       if (lane == 0) mbar_arrive(smem_u32(&bars[NST + st]));
+    }
+#if MODE == 1
+#define WSW 8192
+    const int ra = ct * (8 * W) + warp * 8 + g, rb = 4096 + ra;   // gate row, up row
+#else
+#define WSW 4096
+    const int ra = ct * (16 * W) + warp * 16 + g, rb = ra + 8;
+#endif
+    if (KS > 1) {
+      #pragma unroll
+      for (int b = 0; b < NB; ++b)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int tok = b * 8 + 2 * t + h;
+          if (tok < n) {
+            atomicAdd(&ws[(size_t)(ps + tok) * WSW + ra], acc[b][h]);
+            atomicAdd(&ws[(size_t)(ps + tok) * WSW + rb], acc[b][2 + h]);
+          }
+        }
+      __threadfence();
+      asm volatile("bar.sync 1, %0;" :: "r"(W * 32) : "memory");
+      if (threadIdx.x == 0) {
+        const int tk = atomicAdd(&cnt[item * CT + ct], 1);
+        s_last = (tk == KS - 1);
+        if (s_last) cnt[item * CT + ct] = 0;
+      }
+      asm volatile("bar.sync 1, %0;" :: "r"(W * 32) : "memory");
+      if (!s_last) continue;
+      __threadfence();
+      #pragma unroll
+      for (int b = 0; b < NB; ++b)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int tok = b * 8 + 2 * t + h;
+          if (tok < n) {
+            float* pa = &ws[(size_t)(ps + tok) * WSW + ra];
+            float* pb = &ws[(size_t)(ps + tok) * WSW + rb];
+            acc[b][h] = __ldcg(pa); acc[b][2 + h] = __ldcg(pb);
+            *pa = 0.f; *pb = 0.f;
+          }
+        }
     }
     const float gs = gsc[e];
 #if MODE == 1
@@ -407,14 +474,21 @@ def _compile(src, name, defines=None):
     return _K[key]
 
 
-def _gemm(mode, tb, nst):
-    k = _compile(GEMM_SRC, "moe_gemm", dict(MODE=mode, TB=tb, W=W, KSS=KSS, NSTG=NSTG, NST=nst))
-    k.set_smem(_smem(tb, nst))
+ITEM_FAST = 0  # 1: grid x = item slot (items of one expert together); measured no better
+
+
+EXTRA_DEFS = {}  # experiments only (e.g. NOCOMPUTE)
+
+
+def _gemm(mode, tb, nst, w):
+    k = _compile(GEMM_SRC, "moe_gemm", dict(MODE=mode, TB=tb, W=w, WP=WP, KSS=KSS, NSTG=NSTG, NST=nst,
+                                            ITEM_FAST=ITEM_FAST, **EXTRA_DEFS))
+    k.set_smem(_smem(tb, nst, w))
     return k
 
 
-def _smem(tb, nst):
-    stage = W * KSS * 128 + W * 16 * KSS + tb * (KSS * 32 + 16)
+def _smem(tb, nst, w=WP):
+    stage = w * KSS * 128 + w * 16 * KSS + tb * (KSS * 32 + 16)
     return 128 + nst * stage
 
 
@@ -427,7 +501,7 @@ def _pack(w, sf, rows_map):
     K = Kh * 2
     NS = K // 16
     NWT = rows_map.shape[0]
-    CT = NWT // W
+    CT = NWT // WP
     dev = w.device
     g = torch.arange(8, device=dev)
     t = torch.arange(4, device=dev)
@@ -451,10 +525,10 @@ def _pack(w, sf, rows_map):
                     word |= ((mag & 3) << (10 + 16 * h)) | ((mag >> 2) << (13 + 16 * h)) | (sg << (14 + 16 * h))
         word = torch.where(word >= 2 ** 31, word - 2 ** 32, word).to(torch.int32)
         # [NWT, NS, g, t] -> [CT, W, NSTG, KSS/4, 4, 32] -> [CT, NSTG, W, KSS/4, 32, 4]
-        word = word.view(CT, W, NSTG, KSS // 4, 4, 32).permute(0, 2, 1, 3, 5, 4).contiguous()
+        word = word.view(CT, WP, NSTG, KSS // 4, 4, 32).permute(0, 2, 1, 3, 5, 4).contiguous()
         words.append(word)
         s = sf[e][rows_map].view(torch.uint8)  # [NWT, 16, NS]
-        s = (s & 0x7F).view(CT, W, 16, NSTG, KSS).permute(0, 3, 1, 2, 4).contiguous()
+        s = (s & 0x7F).view(CT, WP, 16, NSTG, KSS).permute(0, 3, 1, 2, 4).contiguous()
         scales.append(s)
     return torch.stack(words), torch.stack(scales)
 
@@ -481,6 +555,9 @@ def prepare(weights):
     st["g1"] = (weights["w13_gs"][sl].float() * 128.0).contiguous()
     st["g2"] = (weights["w2_gs"][sl].float() * 128.0).contiguous()
     st["normw"] = weights["post_norm_w"].contiguous()
+    # split-K workspace (fp32 partial sums, kept zero between uses) and per-(item, row tile) tickets
+    st["ws"] = torch.zeros((WS_PAIRS, 2 * I), dtype=torch.float32, device=dev)
+    st["cnt"] = torch.zeros(WS_ITEMS * (I // (8 * 2)), dtype=torch.int32, device=dev)
     torch.cuda.synchronize()
     return st
 
@@ -488,16 +565,19 @@ def prepare(weights):
 # ---------------------------------------------------------------- timed call
 
 # M -> (tokens per item, pipeline stages, grid slots); tuned on H100 (tune.py)
-CFG = {1: (8, 4, 4), 16: (8, 3, 8), 32: (8, 3, 32), 8: (8, 6, 4), 128: (16, 3, 16), 256: (16, 3, 32)}
+WS_PAIRS = 512      # split-K only for M * 8 <= WS_PAIRS
+WS_ITEMS = 256
+CFG = {1: (8, 4, 4), 16: (8, 3, 4), 32: (8, 2, 16), 8: (8, 2, 4), 128: (16, 2, 16), 256: (16, 2, 64)}
 CFG_OVERRIDE = {}
 
 
 def _cfg(M):
-    if M in CFG_OVERRIDE:
-        return CFG_OVERRIDE[M]
-    if M in CFG:
-        return CFG[M]
-    return (8 if M <= 64 else 16), 3, 16
+    """(tokens per item, stages, grid slots, split-K gemm1, split-K gemm2, warps per CTA)"""
+    c = tuple(CFG_OVERRIDE.get(M) or CFG.get(M) or ((8 if M <= 64 else 16), 3, 16))
+    c = c + (1, 1, WP)[len(c) - 3:]
+    if M * TOPK > WS_PAIRS:
+        c = c[:3] + (1, 1) + c[5:]
+    return c
 
 
 def kernel_fn(data, state):
@@ -510,7 +590,7 @@ def kernel_fn(data, state):
     M = x.shape[0]
     P = M * TOPK
     dev = x.device
-    tb, nst, nslot = _cfg(M)
+    tb, nst, nslot, ks1, ks2, W = _cfg(M)
     maxi = min(NLOC, P) + (P + tb - 1) // tb
     sorted_tok = torch.empty(P, dtype=torch.int32, device=dev)
     pos_of = torch.empty(P, dtype=torch.int32, device=dev)
@@ -524,14 +604,16 @@ def kernel_fn(data, state):
     _compile(ROUTE_SRC, "moe_route")((1, 1, 1), (1024, 1, 1),
                                      (ids, P, int(cfg["local_start"]), tb, sorted_tok, pos_of, items, n_items, ss))
     slots = min(maxi, nslot)
-    smem = _smem(tb, nst)
-    g1 = _gemm(1, tb, nst)
-    g1((I // (8 * W), slots, 1), ((W + 1) * 32, 1, 1),
-       (state["w1q"], state["w1s"], state["g1"], x, sorted_tok, items, n_items, inter, state["normw"], ss),
+    smem = _smem(tb, nst, W)
+    g1 = _gemm(1, tb, nst, W)
+    grid1 = (slots, I // (8 * W), ks1) if ITEM_FAST else (I // (8 * W), slots, ks1)
+    grid2 = (slots, H // (16 * W), ks2) if ITEM_FAST else (H // (16 * W), slots, ks2)
+    g1(grid1, ((W + 1) * 32, 1, 1),
+       (state["w1q"], state["w1s"], state["g1"], x, sorted_tok, items, n_items, inter, state["normw"], ss, state["ws"], state["cnt"]),
        shared_mem=smem)
-    g2 = _gemm(2, tb, nst)
-    g2((H // (16 * W), slots, 1), ((W + 1) * 32, 1, 1),
-       (state["w2q"], state["w2s"], state["g2"], inter, sorted_tok, items, n_items, yw, state["normw"], ss),
+    g2 = _gemm(2, tb, nst, W)
+    g2(grid2, ((W + 1) * 32, 1, 1),
+       (state["w2q"], state["w2s"], state["g2"], inter, sorted_tok, items, n_items, yw, state["normw"], ss, state["ws"], state["cnt"]),
        shared_mem=smem)
     _compile(FINAL_SRC, "moe_final")((M, 1, 1), (512, 1, 1), (yw, ss, pos_of, tw, out))
     return out

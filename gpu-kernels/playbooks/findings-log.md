@@ -7,6 +7,20 @@ tags: [muse, experiments, log]
 
 An append-only log of measured results. Newest first. Each entry gives the date, GPU (H100 Rorqual / H200 judge), problem/shape, the change, the measured numbers, the command, and a verdict (kept / reverted / why).
 
+## 2026-11-10 · H100 (Rorqual) · muse_moe_w4a16: 1.30× → 1.60×
+Commands (in `../muse_moe_w4a16`): `sbatch job.sh python bench.py`, `python tune.py --m ... --tb ... --nst ... --slots ... --ks ... --w ...`, `DISABLE_DCGM=1 sbatch prof_job.sh`. Design: [[nvfp4-moe-weight-streaming]].
+
+| step | geomean | change | evidence |
+|---|---|---|---|
+| v1 | 1.30 | route + 2 mma.sync GEMMs (FP4→BF16 in registers, bulk-copy ring) + norm-sum | correct first try (3.2e-3 vs 1.5% bound) |
+| v1b | 0.53 | TB 32/64 tokens per item to stop re-streaming hot experts | reverted: 130–172 KB smem → 1 CTA/SM; ncu issue-latency-bound |
+| v2 | 1.35 | shift+mask FP4 layout (11 vs 15 ops / 8 weights), own NVRTC/ctypes launcher | torch launcher spawned gcc per launch |
+| v3 | 1.55 | tuned (TB, stages, slots): 2–4 stages win (occupancy) | verify32 607 → 445 µs |
+| v4 | **1.60** | unconditional first token block (no predicated HMMA + WARPSYNC) | 2–4% on every load |
+
+- **No gain (kept as tunables):** split-K (1/2/4) at small M; 2- and 8-warp CTAs; item-major grid order for L2 reuse.
+- **ncu at batch 1:** a copy-only variant still takes 17 + 12 µs (2.2 / 1.6 TB/s). At 256 tokens: issue 69%, about 43 instructions per weight k-step (hot experts re-dequantized per item).
+
 ## 2026-11-09 · H100 (Rorqual) · muse_attention_decode: from 0.68× to 1.44×
 Commands (in `../muse_attention_decode`):
 - `sbatch job.sh python bench.py` (16 tests + 12 scored shapes against the real SGLang/FA3 baseline)
