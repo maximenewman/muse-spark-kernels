@@ -1,0 +1,10 @@
+# third-party: pinned SGLang checkout (re-create with `okc serve init`)
+sglang-pinned/
+# copies of third-party articles/code used as reading material
+gpu-kernels/raw/
+__pycache__/
+*.pyc
+*.ncu-rep
+profiles/
+.DS_Store
+gpu-kernels/.obsidian/workspace.json
