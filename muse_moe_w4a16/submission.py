@@ -17,6 +17,7 @@ cp.async.bulk (1-D TMA) + mbarriers; prepare() lays every CTA's per-stage chunk 
 contiguously, in mma-fragment order (one u32 = one thread's 8 FP4 values for one k-step).
 """
 
+import ctypes
 from typing import TypedDict
 
 import torch
@@ -78,8 +79,15 @@ __device__ __forceinline__ void bulk_g2s(u32 dst, const void* src, u32 bytes, u3
 }
 __device__ __forceinline__ u32 bmul2(u32 a, u32 b) { u32 d; asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b)); return d; }
 __device__ __forceinline__ u32 prmt(u32 a, u32 b, u32 s) { u32 d; asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(s)); return d; }
-// FP4 (s e1 e0 m) nibbles at bits 12-15 and 28-31 -> two bf16 equal to e2m1 * 2^-126.
-__device__ __forceinline__ u32 unp(u32 q) { return (q & 0x80008000u) | ((q >> 6) & 0x01C001C0u); }
+// prepare() places each FP4 code's 3 magnitude bits and sign so that a shift + mask lands them at
+// bf16 bits 6-8 and 15 (and +16): two bf16 equal to e2m1 * 2^-126 (subnormal for the 0.5 code).
+#define FP4M 0x81C081C0u
+__device__ __forceinline__ void unp4(u32 q, u32& a0, u32& a1, u32& a2, u32& a3) {
+  a0 = q & FP4M;
+  a1 = (q << 3) & FP4M;
+  a2 = (q << 6) & FP4M;
+  a3 = ((q >> 4) & 0x00C000C0u) | ((q >> 5) & 0x01000100u) | ((q << 1) & 0x80008000u);
+}
 __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
@@ -251,6 +259,7 @@ extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
         u32 bq[NB][8];
         #pragma unroll
         for (int b = 0; b < NB; ++b) {
+          if (b * 8 >= n) break;
           ldsm4(bq[b][0], bq[b][1], bq[b][2], bq[b][3], xl + b * 8 * XSTRIDE + (kq * 4) * 32);
           ldsm4(bq[b][4], bq[b][5], bq[b][6], bq[b][7], xl + b * 8 * XSTRIDE + (kq * 4 + 2) * 32);
         }
@@ -261,10 +270,11 @@ extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
           const u32 S0 = prmt(sg, 0, sel) * 16u + 0x77807780u;
           const u32 S1 = prmt(sg8, 0, sel) * 16u + 0x77807780u;
           const u32 q = q4[kk];
-          const u32 a0 = bmul2(unp(q), S0), a1 = bmul2(unp(q << 4), S1);
-          const u32 a2 = bmul2(unp(q << 8), S0), a3 = bmul2(unp(q << 12), S1);
+          u32 a0, a1, a2, a3;
+          unp4(q, a0, a1, a2, a3);
+          a0 = bmul2(a0, S0); a1 = bmul2(a1, S1); a2 = bmul2(a2, S0); a3 = bmul2(a3, S1);
           #pragma unroll
-          for (int b = 0; b < NB; ++b) mma16816(acc[b], a0, a1, a2, a3, bq[b][2 * kk], bq[b][2 * kk + 1]);
+          for (int b = 0; b < NB; ++b) { if (b * 8 >= n) break; mma16816(acc[b], a0, a1, a2, a3, bq[b][2 * kk], bq[b][2 * kk + 1]); }
         }
       }
       __syncwarp();
@@ -310,6 +320,82 @@ extern "C" __global__ void __launch_bounds__((W + 1) * 32) moe_gemm(
 }
 """
 
+# ---------------------------------------------------------------- NVRTC + driver, in-process
+# Own ctypes wrapper: libraries are loaded once by soname (no find_library, no subprocesses),
+# kernels compile to a cubin with NVRTC and launch with cuLaunchKernel on torch's stream.
+_LIB = {}
+
+
+def _libs():
+    if not _LIB:
+        major = int(torch.version.cuda.split(".")[0])
+        for name in (f"libnvrtc.so.{major}", "libnvrtc.so"):
+            try:
+                _LIB["nvrtc"] = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        _LIB["cuda"] = ctypes.CDLL("libcuda.so.1")
+        _LIB["cuda"].cuLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
+    return _LIB["nvrtc"], _LIB["cuda"]
+
+
+def _ck(r, what):
+    if r != 0:
+        raise RuntimeError(f"{what} failed with error {r}")
+
+
+class _Kernel:
+    def __init__(self, src, name):
+        nvrtc, cuda = _libs()
+        torch.cuda.init()
+        torch.zeros(1, device="cuda")  # make torch's primary context current
+        prog = ctypes.c_void_p()
+        _ck(nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src.encode(), f"{name}.cu".encode(), 0, None, None),
+            "nvrtcCreateProgram")
+        cc = torch.cuda.get_device_capability()
+        opts = [f"--gpu-architecture=sm_{cc[0]}{cc[1]}{'a' if cc[0] == 9 else ''}".encode(), b"-std=c++17",
+                b"--use_fast_math", b"-default-device"]
+        arr = (ctypes.c_char_p * len(opts))(*opts)
+        r = nvrtc.nvrtcCompileProgram(prog, len(opts), arr)
+        if r != 0:
+            n = ctypes.c_size_t()
+            nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(n))
+            log = ctypes.create_string_buffer(n.value)
+            nvrtc.nvrtcGetProgramLog(prog, log)
+            raise RuntimeError(f"NVRTC compile of {name} failed:\n{log.value.decode()}")
+        n = ctypes.c_size_t()
+        _ck(nvrtc.nvrtcGetCUBINSize(prog, ctypes.byref(n)), "nvrtcGetCUBINSize")
+        self.cubin = ctypes.create_string_buffer(n.value)
+        _ck(nvrtc.nvrtcGetCUBIN(prog, self.cubin), "nvrtcGetCUBIN")
+        nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+        self.mod = ctypes.c_void_p()
+        _ck(cuda.cuModuleLoadData(ctypes.byref(self.mod), self.cubin), "cuModuleLoadData")
+        self.func = ctypes.c_void_p()
+        _ck(cuda.cuModuleGetFunction(ctypes.byref(self.func), self.mod, name.encode()), "cuModuleGetFunction")
+        self.smem = 0
+
+    def set_smem(self, nbytes):
+        if nbytes > self.smem:
+            # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
+            _ck(_libs()[1].cuFuncSetAttribute(self.func, 8, int(nbytes)), "cuFuncSetAttribute")
+            self.smem = nbytes
+
+    def __call__(self, grid, block, args, shared_mem=0):
+        keep = []
+        for a in args:
+            if isinstance(a, torch.Tensor):
+                keep.append(ctypes.c_void_p(a.data_ptr()))
+            elif isinstance(a, float):
+                keep.append(ctypes.c_float(a))
+            else:
+                keep.append(ctypes.c_int(a))
+        ptrs = (ctypes.c_void_p * len(keep))(*[ctypes.addressof(k) for k in keep])
+        stream = torch.cuda.current_stream().cuda_stream
+        _ck(_libs()[1].cuLaunchKernel(self.func, grid[0], grid[1], grid[2], block[0], block[1], block[2],
+                                      shared_mem, stream, ptrs, None), "cuLaunchKernel")
+
+
 _K = {}
 
 
@@ -317,14 +403,13 @@ def _compile(src, name, defines=None):
     head = "".join(f"#define {k} {v}\n" for k, v in (defines or {}).items())
     key = (name, head)
     if key not in _K:
-        _K[key] = torch.cuda._compile_kernel(head + src, name, nvcc_options=["-std=c++17", "--use_fast_math"])
+        _K[key] = _Kernel(head + src, name)
     return _K[key]
 
 
 def _gemm(mode, tb, nst):
     k = _compile(GEMM_SRC, "moe_gemm", dict(MODE=mode, TB=tb, W=W, KSS=KSS, NSTG=NSTG, NST=nst))
-    if k._max_shared_mem_bytes < _smem(tb, nst):
-        k.set_shared_memory_config(_smem(tb, nst))
+    k.set_smem(_smem(tb, nst))
     return k
 
 
@@ -358,7 +443,12 @@ def _pack(w, sf, rows_map):
             hi = A[:, r, :, kk + 1]
             lo = lo.permute(2, 3, 0, 1)
             hi = hi.permute(2, 3, 0, 1)
-            word |= (lo << (12 - 4 * j)) | (hi << (28 - 4 * j))
+            for h, c in ((0, lo), (1, hi)):
+                mag, sg = c & 7, c >> 3
+                if j < 3:
+                    word |= (mag << (6 - 3 * j + 16 * h)) | (sg << (15 - 3 * j + 16 * h))
+                else:
+                    word |= ((mag & 3) << (10 + 16 * h)) | ((mag >> 2) << (13 + 16 * h)) | (sg << (14 + 16 * h))
         word = torch.where(word >= 2 ** 31, word - 2 ** 32, word).to(torch.int32)
         # [NWT, NS, g, t] -> [CT, W, NSTG, KSS/4, 4, 32] -> [CT, NSTG, W, KSS/4, 32, 4]
         word = word.view(CT, W, NSTG, KSS // 4, 4, 32).permute(0, 2, 1, 3, 5, 4).contiguous()
@@ -397,9 +487,17 @@ def prepare(weights):
 
 # ---------------------------------------------------------------- timed call
 
+# M -> (tokens per item, pipeline stages, grid slots); tuned on H100 (tune.py)
+CFG = {1: (8, 4, 4), 16: (8, 3, 8), 32: (8, 3, 32), 8: (8, 6, 4), 128: (16, 3, 16), 256: (16, 3, 32)}
+CFG_OVERRIDE = {}
+
+
 def _cfg(M):
-    tb = 8 if M <= 128 else 16
-    return tb, 6
+    if M in CFG_OVERRIDE:
+        return CFG_OVERRIDE[M]
+    if M in CFG:
+        return CFG[M]
+    return (8 if M <= 64 else 16), 3, 16
 
 
 def kernel_fn(data, state):
@@ -412,7 +510,7 @@ def kernel_fn(data, state):
     M = x.shape[0]
     P = M * TOPK
     dev = x.device
-    tb, nst = _cfg(M)
+    tb, nst, nslot = _cfg(M)
     maxi = min(NLOC, P) + (P + tb - 1) // tb
     sorted_tok = torch.empty(P, dtype=torch.int32, device=dev)
     pos_of = torch.empty(P, dtype=torch.int32, device=dev)
@@ -425,7 +523,7 @@ def kernel_fn(data, state):
 
     _compile(ROUTE_SRC, "moe_route")((1, 1, 1), (1024, 1, 1),
                                      (ids, P, int(cfg["local_start"]), tb, sorted_tok, pos_of, items, n_items, ss))
-    slots = min(maxi, 16)
+    slots = min(maxi, nslot)
     smem = _smem(tb, nst)
     g1 = _gemm(1, tb, nst)
     g1((I // (8 * W), slots, 1), ((W + 1) * 32, 1, 1),
